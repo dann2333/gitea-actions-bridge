@@ -3,6 +3,10 @@ import hmac
 import http.client
 import json
 import threading
+import tempfile
+import sqlite3
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 import unittest
 from http.server import ThreadingHTTPServer
 from unittest.mock import MagicMock, patch
@@ -13,10 +17,9 @@ from app import make_handler
 
 class RelayTest(unittest.TestCase):
     def setUp(self):
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(
-            "test-secret", "test-token", "owner/bridge", "runner.yml"))
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
-        self.thread.start()
+        self.temp = tempfile.TemporaryDirectory()
+        self.db_path = str(Path(self.temp.name) / "bridge.db")
+        self.start_server()
         self.payload = {"action": "queued", "repository": {"id": 1},
                         "workflow_job": {"id": 2, "run_attempt": 1,
                                          "labels": ["github-hosted"]}}
@@ -29,6 +32,19 @@ class RelayTest(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
         self.thread.join()
+        self.temp.cleanup()
+
+    def start_server(self):
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(
+            "test-secret", "test-token", "owner/bridge", "runner.yml", db_path=self.db_path))
+        self.thread = threading.Thread(target=lambda: self.server.serve_forever(0.05), daemon=True)
+        self.thread.start()
+
+    def restart(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join()
+        self.start_server()
 
     def send(self, payload=None, signature=None, event="workflow_job"):
         body = json.dumps(self.payload if payload is None else payload).encode()
@@ -82,6 +98,98 @@ class RelayTest(unittest.TestCase):
         self.assertNotIn("private secret", message)
         self.upstream.side_effect = None
         self.assertEqual(self.send()[0], 202)
+
+    def test_success_survives_restart(self):
+        self.assertEqual(self.send()[0], 202)
+        self.restart()
+        self.assertEqual(self.send(), (200, "duplicate\n"))
+        self.assertEqual(self.upstream.call_count, 1)
+
+    def test_ambiguous_failure_survives_restart(self):
+        for error in (TimeoutError(), HTTPError("https://api.github.com", 500, "secret", {}, None)):
+            self.payload["workflow_job"]["id"] += 1
+            self.upstream.side_effect = error
+            self.assertEqual(self.send()[0], 502)
+            self.restart()
+            calls = self.upstream.call_count
+            self.upstream.side_effect = None
+            self.assertEqual(self.send()[0], 409)
+            self.assertEqual(self.upstream.call_count, calls)
+
+    def test_crashed_pending_record_not_retried(self):
+        target = "https://api.github.com/repos/owner/bridge/actions/workflows/runner.yml/dispatches#main"
+        with sqlite3.connect(self.db_path) as db:
+            db.execute("INSERT INTO dispatches VALUES (?, 1, 2, 1, 'pending')", (target,))
+        self.restart()
+        self.assertEqual(self.send()[0], 409)
+        self.upstream.assert_not_called()
+
+    def test_rejection_can_retry_after_restart(self):
+        self.upstream.side_effect = HTTPError("https://api.github.com", 403, "secret", {}, None)
+        self.assertEqual(self.send()[0], 502)
+        self.restart()
+        self.upstream.side_effect = None
+        self.assertEqual(self.send()[0], 202)
+
+    def test_same_key_concurrent_only_dispatches_once(self):
+        entered, release = threading.Event(), threading.Event()
+        response = self.upstream.return_value
+
+        def wait(*args, **kwargs):
+            entered.set()
+            release.wait(3)
+            return response
+
+        self.upstream.side_effect = wait
+        with ThreadPoolExecutor() as pool:
+            first = pool.submit(self.send)
+            try:
+                self.assertTrue(entered.wait(2))
+                self.assertEqual(self.send()[0], 409)
+            finally:
+                release.set()
+            self.assertEqual(first.result()[0], 202)
+        self.assertEqual(self.upstream.call_count, 1)
+
+    def test_different_keys_dispatch_concurrently(self):
+        barrier = threading.Barrier(2)
+        response = self.upstream.return_value
+
+        def wait(*args, **kwargs):
+            barrier.wait(2)  # Fails if a global lock spans the network request.
+            return response
+
+        self.upstream.side_effect = wait
+        other = json.loads(json.dumps(self.payload))
+        other["workflow_job"]["id"] = 3
+        with ThreadPoolExecutor() as pool:
+            first = pool.submit(self.send)
+            second = pool.submit(self.send, other)
+            self.assertEqual(first.result()[0], 202)
+            self.assertEqual(second.result()[0], 202)
+
+    def test_database_failure_prevents_dispatch(self):
+        with patch("app.sqlite3.connect", side_effect=sqlite3.OperationalError("disk full")):
+            self.assertEqual(self.send()[0], 503)
+        self.upstream.assert_not_called()
+
+    def test_database_failure_after_acceptance_does_not_redispatch(self):
+        response = self.upstream.return_value
+
+        def accepted(*args, **kwargs):
+            self.failure = patch("app.sqlite3.connect", side_effect=sqlite3.OperationalError("disk full"))
+            self.failure.start()
+            return response
+
+        self.upstream.side_effect = accepted
+        try:
+            self.assertEqual(self.send()[0], 503)
+        finally:
+            self.failure.stop()
+        self.upstream.side_effect = None
+        self.restart()
+        self.assertEqual(self.send()[0], 409)
+        self.assertEqual(self.upstream.call_count, 1)
 
     def test_bad_payload(self):
         for payload in ({}, [], {"workflow_job": None}):
